@@ -36,7 +36,7 @@ logging.basicConfig(
 logger = logging.getLogger("PortScanDetector")
 
 class PortScanDetector:
-    def init(self, interface, email, config_file="config.json"):
+    def __init__(self, interface, email, config_file="config.json"):
         self.interface = interface
         self.admin_email = email
         self.config_file = config_file
@@ -108,7 +108,7 @@ class PortScanDetector:
                 "use_tls": True,
                 "username": "guntakamaheshwarreddy9@gmail.com",  # To be provided separately for security
                 "password": "mahi@2468",  # To be provided separately for security
-                "from_address": ""
+                "from_address": "Mahi"
             }
         }
         
@@ -427,7 +427,7 @@ class PortScanDetector:
             filter_path = "/etc/fail2ban/filter.d/port-scan.conf"
             
             filter_content = """[Definition]
-failregex = ^.Port scan detected from <HOST>.$
+failregex = ^.*Port scan detected from <HOST>.*$
 ignoreregex =
 """
             
@@ -536,260 +536,4 @@ This is an automated message from Port Scan Detector.
         # Check if this is a port in our sequence
         if port not in sequence:
             # Reset the sequence for this IP if they hit a port not in sequence
-            if ip in self.port_knock_state and len(self.port_knock_state[ip]) > 0:
-                self.port_knock_state[ip] = []
-            return
-        
-        # Get the current state for this IP
-        current_state = self.port_knock_state.get(ip, [])
-        
-        # Check if this is the next port in sequence
-        next_index = len(current_state)
-        if next_index >= len(sequence):
-            # They've already completed the sequence
-            return
-            
-        if port == sequence[next_index]:
-            # Correct next port in sequence
-            current_state.append(port)
-            self.port_knock_state[ip] = current_state
-            
-            # Check if they've completed the sequence
-            if len(current_state) == len(sequence):
-                logger.info(f"IP {ip} completed the port knocking sequence")
-                
-                # Allow access to the protected port
-                self.allow_temporary_access(ip, protected_port)
-                
-                # Reset the sequence
-                self.port_knock_state[ip] = []
-        else:
-            # Incorrect port, reset sequence
-            self.port_knock_state[ip] = []
-    
-    def allow_temporary_access(self, ip, port):
-        """Allow temporary access to a port for a specific IP"""
-        try:
-            # Add a temporary rule to allow access
-            subprocess.run([
-                "iptables", "-I", "INPUT", "1", "-s", ip, "-p", "tcp", 
-                "--dport", str(port), "-j", "ACCEPT"
-            ], check=True)
-            
-            logger.info(f"Granted temporary access to port {port} for IP {ip}")
-            
-            # Schedule rule removal
-            threading.Timer(
-                300,  # 5 minutes access
-                self.remove_temporary_access,
-                args=[ip, port]
-            ).start()
-            
-            # Send notification
-            self.send_alert_email(
-                f"Port Knock Success: {ip}",
-                f"IP {ip} successfully completed the port knocking sequence and was granted access to port {port} for 5 minutes."
-            )
-            
-        except Exception as e:
-            logger.error(f"Failed to grant temporary access to {ip}: {e}")
-    
-    def remove_temporary_access(self, ip, port):
-        """Remove temporary access rule"""
-        try:
-            subprocess.run([
-                "iptables", "-D", "INPUT", "-s", ip, "-p", "tcp", 
-                "--dport", str(port), "-j", "ACCEPT"
-            ], check=True)
-            
-            logger.info(f"Removed temporary access to port {port} for IP {ip}")
-            
-        except Exception as e:
-            logger.error(f"Failed to remove temporary access for {ip}: {e}")
-    
-    def detect_scan_type(self, ip, ports):
-        """Detect the type of scan based on port pattern"""
-        # Look for signatures of common scanning tools
-        port_str = ','.join(map(str, ports))
-        
-        # Detect Nmap scans
-        if any(x in [20, 21, 22, 23, 25, 80, 443] for x in ports) and len(ports) > 5:
-            return "Possible Nmap scan (common ports pattern)"
-            
-        # Detect SYN scans - would need packet inspection data
-        
-        # Detect aggressive scans
-        if len(ports) > self.config["thresholds"]["aggressive_scan"]:
-            return f"Aggressive scan ({len(ports)} ports in short time)"
-            
-        # Default detection
-        return f"Port scan detected ({len(ports)} ports)"
-    
-    def start_capture(self):
-        """Start capturing packets using tshark"""
-        logger.info(f"Starting packet capture on interface {self.interface}")
-        
-        # Check if tshark is available
-        try:
-            subprocess.run(["which", "tshark"], check=True, stdout=subprocess.PIPE)
-        except subprocess.CalledProcessError:
-            logger.error("tshark not found, please install Wireshark")
-            sys.exit(1)
-        
-        # Build the tshark command for TCP connection attempts
-        cmd = [
-            "tshark", "-i", self.interface, "-f", "tcp", 
-            "-T", "fields", "-e", "ip.src", "-e", "tcp.dstport", 
-            "-e", "tcp.flags"
-        ]
-        
-        try:
-            # Start tshark process
-            process = subprocess.Popen(
-                cmd, 
-                stdout=subprocess.PIPE, 
-                stderr=subprocess.PIPE,
-                universal_newlines=True
-            )
-            
-            logger.info("Packet capture started successfully")
-            
-            # Start analyzer thread
-            threading.Thread(
-                target=self.analyze_connections,
-                daemon=True
-            ).start()
-            
-            # Process tshark output
-            for line in process.stdout:
-                line = line.strip()
-                if not line:
-                    continue
-                    
-                parts = line.split()
-                if len(parts) < 3:
-                    continue
-                    
-                src_ip = parts[0]
-                dst_port = int(parts[1])
-                flags = int(parts[2], 16)
-                
-                # Check if this is a SYN packet (connection attempt)
-                # TCP flags: SYN = 0x02
-                if (flags & 0x02) and not (flags & 0x10):  # SYN but not ACK
-                    self.process_connection_attempt(src_ip, dst_port)
-                
-        except KeyboardInterrupt:
-            logger.info("Capture stopped by user")
-        except Exception as e:
-            logger.error(f"Error during packet capture: {e}")
-        finally:
-            if process:
-                process.terminate()
-                process.wait()
-            logger.info("Packet capture stopped")
-    
-    def process_connection_attempt(self, ip, port):
-        """Process a connection attempt"""
-        # Skip localhost
-        if ip == "127.0.0.1" or ip.startswith("::1"):
-            return
-            
-        # Skip already blocked IPs
-        if ip in self.blocked_ips:
-            return
-            
-        # Process port knocking
-        self.process_port_knock(ip, port)
-        
-        # Apply tarpit if IP is in tarpit list
-        if ip in self.tarpit_ips:
-            time.sleep(self.config["tarpitting"]["delay"])
-            
-        # Record the connection attempt
-        now = datetime.now()
-        self.connection_attempts[ip].append((now, port))
-        
-        # Clean up old attempts
-        threshold_time = now - timedelta(seconds=self.config["thresholds"]["time_window"])
-        self.connection_attempts[ip] = [
-            (t, p) for t, p in self.connection_attempts[ip] 
-            if t >= threshold_time
-        ]
-    
-    def analyze_connections(self):
-        """Analyze connection patterns for port scanning"""
-        logger.info("Starting connection analyzer thread")
-        
-        while True:
-            try:
-                now = datetime.now()
-                threshold_time = now - timedelta(seconds=self.config["thresholds"]["time_window"])
-                
-                for ip, attempts in self.connection_attempts.items():
-                    # Skip already blocked IPs
-                    if ip in self.blocked_ips:
-                        continue
-                        
-                    # Filter recent attempts
-                    recent = [(t, p) for t, p in attempts if t >= threshold_time]
-                    
-                    # Count unique ports
-                    unique_ports = set(p for _, p in recent)
-                    
-                    # If the number of unique ports exceeds threshold, it's a port scan
-                    if len(unique_ports) >= self.config["thresholds"]["scan_detection"]:
-                        # Identify scan type
-                        scan_type = self.detect_scan_type(ip, unique_ports)
-                        logger.warning(f"{scan_type} from {ip}: {sorted(unique_ports)}")
-                        
-                        # Add to fail2ban
-                        self.send_to_fail2ban(ip, scan_type)
-                        
-                        # Apply defensive measures based on severity
-                        if len(unique_ports) >= self.config["thresholds"]["aggressive_scan"]:
-                            # Aggressive scan - block immediately
-                            self.block_ip(ip)
-                        else:
-                            # Less aggressive - start with rate limiting and tarpitting
-                            self.apply_rate_limit(ip)
-                            self.apply_tarpit(ip)
-                            
-                        # Send alert
-                        self.send_alert_email(
-                            f"Port Scan Detected: {ip}",
-                            f"Detection: {scan_type}\n" +
-                            f"Unique ports: {len(unique_ports)}\n" +
-                            f"Ports: {sorted(unique_ports)}\n\n" +
-                            f"Actions taken: {'Blocked' if len(unique_ports) >= self.config['thresholds']['aggressive_scan'] else 'Rate limited and tarpitted'}"
-                        )
-                        
-                        # Clear the attempts for this IP
-                        self.connection_attempts[ip] = []
-                
-                # Sleep for a bit to avoid high CPU usage
-                time.sleep(5)
-                
-            except Exception as e:
-                logger.error(f"Error in connection analyzer: {e}")
-                time.sleep(10)  # Sleep longer on error
-
-def main():
-    """Main function to parse arguments and start the detector"""
-    parser = argparse.ArgumentParser(description="Port Scan Detector using Wireshark/tshark")
-    parser.add_argument("-i", "--interface", required=True, help="Network interface to monitor")
-    parser.add_argument("-e", "--email", required=True, help="Email address for alerts")
-    parser.add_argument("-c", "--config", default="config.json", help="Path to configuration file")
-    args = parser.parse_args()
-    
-    # Check permissions
-    if os.geteuid() != 0:
-        print("This script must be run as root to capture packets and configure firewall")
-        sys.exit(1)
-        
-    # Create and start detector
-    detector = PortScanDetector(args.interface, args.email, args.config)
-    detector.start_capture()
-
-if name == "main":
-    main()
+            if ip 
